@@ -1765,4 +1765,19 @@ void multipleTapDet(int16_t u, uint32_t timeNow, MultipleTap *x) {
   x->t_timePrev 	  = t_time;
 }
 
+#ifdef CONTROL_CRSF
+  static uint16_t crsf_ch[16];
+#endif
+
+// in the USART RX byte handler (where IBUS is handled)
+#ifdef CONTROL_CRSF
+  if (crsf_feed_byte(rx_byte)) {
+    crsf_read_channels(crsf_ch);
+    // Map channels to steer/speed in the same scaling the code already uses for IBUS:
+    // 1000..2000 → 0..1000, then center at 500, multiply by 2
+    input1[inIdx].raw = ( ( (crsf_ch[0] - 1000) ) - 500 ) * 2; // steer
+    input2[inIdx].raw = ( ( (crsf_ch[1] - 1000) ) - 500 ) * 2; // speed
+  }
+#endif
+
 
