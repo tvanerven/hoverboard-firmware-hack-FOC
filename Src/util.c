@@ -66,6 +66,11 @@ extern volatile uint16_t ppm_captured_value[PPM_NUM_CHANNELS+1];
 extern volatile uint16_t pwm_captured_ch1_value;
 extern volatile uint16_t pwm_captured_ch2_value;
 #endif
+#ifdef CONTROL_CRSF
+extern uint8_t  crsf_feed_byte(uint8_t b);              // from your CRSF parser
+extern void     crsf_read_channels(uint16_t out[16]);   // from your CRSF parser
+static uint16_t crsf_ch[16];
+#endif
 
 
 //------------------------------------------------------------------------
@@ -1152,7 +1157,50 @@ void usart2_rx_check(void)
   if (old_pos == rx_buffer_L_len) {                                     // Check and manually update if we reached end of buffer
     old_pos = 0;
   }
+  #ifdef CONTROL_CRSF
+    if (pos != old_pos) {
+      // Linear region
+      if (pos > old_pos) {
+        for (uint32_t i = old_pos; i < pos; ++i) {
+          if (crsf_feed_byte(rx_buffer_L[i])) {
+            crsf_read_channels(crsf_ch);
+            // map CRSF ch0/ch1 to steer/speed (1000..2000 → 0..1000 → center & scale)
+            input1[inIdx].raw = ((crsf_ch[0] - 1000) - 500) * 2;
+            input2[inIdx].raw = ((crsf_ch[1] - 1000) - 500) * 2;
+            #ifdef CONTROL_SERIAL_USART2
+            timeoutFlgSerial_L = 0;
+            timeoutCntSerial_L = 0;
+            #endif
+          }
+        }
+      } else { // wrapped region
+        for (uint32_t i = old_pos; i < rx_buffer_L_len; ++i) {
+          if (crsf_feed_byte(rx_buffer_L[i])) {
+            crsf_read_channels(crsf_ch);
+            input1[inIdx].raw = ((crsf_ch[0] - 1000) - 500) * 2;
+            input2[inIdx].raw = ((crsf_ch[1] - 1000) - 500) * 2;
+            #ifdef CONTROL_SERIAL_USART2
+            timeoutFlgSerial_L = 0;
+            timeoutCntSerial_L = 0;
+            #endif
+          }
+        }
+        for (uint32_t i = 0; i < pos; ++i) {
+          if (crsf_feed_byte(rx_buffer_L[i])) {
+            crsf_read_channels(crsf_ch);
+            input1[inIdx].raw = ((crsf_ch[0] - 1000) - 500) * 2;
+            input2[inIdx].raw = ((crsf_ch[1] - 1000) - 500) * 2;
+            #ifdef CONTROL_SERIAL_USART2
+            timeoutFlgSerial_L = 0;
+            timeoutCntSerial_L = 0;
+            #endif
+          }
+        }
+      }
+    }
+  #endif
 	#endif
+  
 }
 
 
@@ -1162,70 +1210,117 @@ void usart2_rx_check(void)
  */
 void usart3_rx_check(void)
 {
-  #if defined(DEBUG_SERIAL_USART3) || defined(CONTROL_SERIAL_USART3) || defined(SIDEBOARD_SERIAL_USART3)
-  static uint32_t old_pos;
-  uint32_t pos;  
-  pos = rx_buffer_R_len - __HAL_DMA_GET_COUNTER(huart3.hdmarx);         // Calculate current position in buffer
-  #endif
+/* Only compile any USART3 handling if USART3 DMA buffer actually exists */
+#if defined(DEBUG_SERIAL_USART3) || defined(CONTROL_SERIAL_USART3) || defined(SIDEBOARD_SERIAL_USART3)
 
+  static uint32_t old_pos;
+  uint32_t pos;
+  pos = rx_buffer_R_len - __HAL_DMA_GET_COUNTER(huart3.hdmarx);   // Current DMA write position
+
+  /* ---------------- DEBUG ---------------- */
   #if defined(DEBUG_SERIAL_USART3)
   uint8_t ptr_debug[SERIAL_BUFFER_SIZE];
 
-  if (pos != old_pos) {                                                 // Check change in received data
-    if (pos > old_pos) {                                                // "Linear" buffer mode: check if current position is over previous one
-      usart_process_debug(&rx_buffer_R[old_pos], pos - old_pos);        // Process data
-    } else {                                                            // "Overflow" buffer mode
-      memcpy(&ptr_debug[0], &rx_buffer_R[old_pos], rx_buffer_R_len - old_pos);    // First copy data from the end of buffer
-      if (pos > 0) {                                                    // Check and continue with beginning of buffer
-        memcpy(&ptr_debug[rx_buffer_R_len - old_pos], &rx_buffer_R[0], pos);                              // Copy remaining data
+  if (pos != old_pos) {
+    if (pos > old_pos) { // linear region
+      usart_process_debug(&rx_buffer_R[old_pos], pos - old_pos);
+    } else {              // wrapped region
+      memcpy(&ptr_debug[0], &rx_buffer_R[old_pos], rx_buffer_R_len - old_pos);
+      if (pos > 0) {
+        memcpy(&ptr_debug[rx_buffer_R_len - old_pos], &rx_buffer_R[0], pos);
       }
-      usart_process_debug(ptr_debug, rx_buffer_R_len - old_pos + pos);        // Process data
+      usart_process_debug(ptr_debug, rx_buffer_R_len - old_pos + pos);
     }
   }
-  #endif // DEBUG_SERIAL_USART3
+  #endif /* DEBUG_SERIAL_USART3 */
 
+  /* --------------- COMMAND ---------------- */
   #ifdef CONTROL_SERIAL_USART3
-  uint8_t *ptr;
-  if (pos != old_pos) {                                                 // Check change in received data
-    ptr = (uint8_t *)&commandR_raw;                                     // Initialize the pointer with command_raw address
-    if (pos > old_pos && (pos - old_pos) == commandR_len) {             // "Linear" buffer mode: check if current position is over previous one AND data length equals expected length
-      memcpy(ptr, &rx_buffer_R[old_pos], commandR_len);                 // Copy data. This is possible only if command_raw is contiguous! (meaning all the structure members have the same size)
-      usart_process_command(&commandR_raw, &commandR, 3);               // Process data
-    } else if ((rx_buffer_R_len - old_pos + pos) == commandR_len) {     // "Overflow" buffer mode: check if data length equals expected length
-      memcpy(ptr, &rx_buffer_R[old_pos], rx_buffer_R_len - old_pos);    // First copy data from the end of buffer
-      if (pos > 0) {                                                    // Check and continue with beginning of buffer
-        ptr += rx_buffer_R_len - old_pos;                               // Move to correct position in command_raw
-        memcpy(ptr, &rx_buffer_R[0], pos);                              // Copy remaining data
+  if (pos != old_pos) {
+    uint8_t *ptr = (uint8_t *)&commandR_raw;
+    if (pos > old_pos && (pos - old_pos) == commandR_len) {         // linear
+      memcpy(ptr, &rx_buffer_R[old_pos], commandR_len);
+      usart_process_command(&commandR_raw, &commandR, 3);
+    } else if ((rx_buffer_R_len - old_pos + pos) == commandR_len) {  // wrapped
+      memcpy(ptr, &rx_buffer_R[old_pos], rx_buffer_R_len - old_pos);
+      if (pos > 0) {
+        ptr += rx_buffer_R_len - old_pos;
+        memcpy(ptr, &rx_buffer_R[0], pos);
       }
-      usart_process_command(&commandR_raw, &commandR, 3);               // Process data
+      usart_process_command(&commandR_raw, &commandR, 3);
     }
   }
-  #endif // CONTROL_SERIAL_USART3
+  #endif /* CONTROL_SERIAL_USART3 */
 
+  /* -------------- SIDEBOARD -------------- */
   #ifdef SIDEBOARD_SERIAL_USART3
-  uint8_t *ptr;
-  if (pos != old_pos) {                                                 // Check change in received data
-    ptr = (uint8_t *)&Sideboard_R_raw;                                  // Initialize the pointer with Sideboard_raw address
-    if (pos > old_pos && (pos - old_pos) == Sideboard_R_len) {          // "Linear" buffer mode: check if current position is over previous one AND data length equals expected length
-      memcpy(ptr, &rx_buffer_R[old_pos], Sideboard_R_len);              // Copy data. This is possible only if Sideboard_raw is contiguous! (meaning all the structure members have the same size)
-      usart_process_sideboard(&Sideboard_R_raw, &Sideboard_R, 3);       // Process data
-    } else if ((rx_buffer_R_len - old_pos + pos) == Sideboard_R_len) {  // "Overflow" buffer mode: check if data length equals expected length
-      memcpy(ptr, &rx_buffer_R[old_pos], rx_buffer_R_len - old_pos);    // First copy data from the end of buffer
-      if (pos > 0) {                                                    // Check and continue with beginning of buffer
-        ptr += rx_buffer_R_len - old_pos;                               // Move to correct position in Sideboard_raw
-        memcpy(ptr, &rx_buffer_R[0], pos);                              // Copy remaining data
+  if (pos != old_pos) {
+    uint8_t *ptr = (uint8_t *)&Sideboard_R_raw;
+    if (pos > old_pos && (pos - old_pos) == Sideboard_R_len) {        // linear
+      memcpy(ptr, &rx_buffer_R[old_pos], Sideboard_R_len);
+      usart_process_sideboard(&Sideboard_R_raw, &Sideboard_R, 3);
+    } else if ((rx_buffer_R_len - old_pos + pos) == Sideboard_R_len) { // wrapped
+      memcpy(ptr, &rx_buffer_R[old_pos], rx_buffer_R_len - old_pos);
+      if (pos > 0) {
+        ptr += rx_buffer_R_len - old_pos;
+        memcpy(ptr, &rx_buffer_R[0], pos);
       }
-      usart_process_sideboard(&Sideboard_R_raw, &Sideboard_R, 3);       // Process data
+      usart_process_sideboard(&Sideboard_R_raw, &Sideboard_R, 3);
     }
   }
-  #endif // SIDEBOARD_SERIAL_USART3
+  #endif /* SIDEBOARD_SERIAL_USART3 */
 
-  #if defined(DEBUG_SERIAL_USART3) || defined(CONTROL_SERIAL_USART3) || defined(SIDEBOARD_SERIAL_USART3)
-  old_pos = pos;                                                        // Update old position
-  if (old_pos == rx_buffer_R_len) {                                     // Check and manually update if we reached end of buffer
-    old_pos = 0;
+  /* ----------------- CRSF ----------------- */
+  /* Only feed CRSF from USART3 if both CRSF is enabled AND USART3 buffer exists */
+  #if defined(CONTROL_CRSF)
+  if (pos != old_pos) {
+    if (pos > old_pos) { // linear
+      for (uint32_t i = old_pos; i < pos; ++i) {
+        if (crsf_feed_byte(rx_buffer_R[i])) {
+          crsf_read_channels(crsf_ch);
+          // ch0: steer, ch1: speed. Convert 1000..2000 -> 0..1000, center 500, scale *2.
+          input1[inIdx].raw = ((crsf_ch[0] - 1000) - 500) * 2;
+          input2[inIdx].raw = ((crsf_ch[1] - 1000) - 500) * 2;
+          #ifdef CONTROL_SERIAL_USART3
+          timeoutFlgSerial_R = 0;
+          timeoutCntSerial_R = 0;
+          #endif
+        }
+      }
+    } else { // wrapped
+      for (uint32_t i = old_pos; i < rx_buffer_R_len; ++i) {
+        if (crsf_feed_byte(rx_buffer_R[i])) {
+          crsf_read_channels(crsf_ch);
+          input1[inIdx].raw = ((crsf_ch[0] - 1000) - 500) * 2;
+          input2[inIdx].raw = ((crsf_ch[1] - 1000) - 500) * 2;
+          #ifdef CONTROL_SERIAL_USART3
+          timeoutFlgSerial_R = 0;
+          timeoutCntSerial_R = 0;
+          #endif
+        }
+      }
+      for (uint32_t i = 0; i < pos; ++i) {
+        if (crsf_feed_byte(rx_buffer_R[i])) {
+          crsf_read_channels(crsf_ch);
+          input1[inIdx].raw = ((crsf_ch[0] - 1000) - 500) * 2;
+          input2[inIdx].raw = ((crsf_ch[1] - 1000) - 500) * 2;
+          #ifdef CONTROL_SERIAL_USART3
+          timeoutFlgSerial_R = 0;
+          timeoutCntSerial_R = 0;
+          #endif
+        }
+      }
+    }
   }
-  #endif
+  #endif /* CONTROL_CRSF */
+
+  /* ------------- cursor update ----------- */
+  old_pos = pos;                          // finally update the cursor
+  if (old_pos == rx_buffer_R_len) {
+    old_pos = 0;                          // wrap when reaching end
+  }
+
+#endif /* any USART3 consumer compiled in */
 }
 
 /*
@@ -1764,20 +1859,4 @@ void multipleTapDet(int16_t u, uint32_t timeNow, MultipleTap *x) {
   x->b_hysteresis 	= b_hyst;
   x->t_timePrev 	  = t_time;
 }
-
-#ifdef CONTROL_CRSF
-  static uint16_t crsf_ch[16];
-#endif
-
-// in the USART RX byte handler (where IBUS is handled)
-#ifdef CONTROL_CRSF
-  if (crsf_feed_byte(rx_byte)) {
-    crsf_read_channels(crsf_ch);
-    // Map channels to steer/speed in the same scaling the code already uses for IBUS:
-    // 1000..2000 → 0..1000, then center at 500, multiply by 2
-    input1[inIdx].raw = ( ( (crsf_ch[0] - 1000) ) - 500 ) * 2; // steer
-    input2[inIdx].raw = ( ( (crsf_ch[1] - 1000) ) - 500 ) * 2; // speed
-  }
-#endif
-
 
